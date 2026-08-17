@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import tempfile
 import time
@@ -305,20 +306,22 @@ class InferencePipeline:
             return ""
 
         text = str(transcript).strip()
-        blank_markers = {
-            "[BLANK_AUDIO]",
-            "(BLANK_AUDIO)",
-            "<|nospeech|>",
-            "<|no_speech|>",
-        }
-        if text.upper() in blank_markers:
-            return ""
+        text = re.sub(r"(?i)\[?\(?\s*blank[_\s-]*audio\s*\)?\]?", " ", text)
+        text = re.sub(r"(?i)<\|no[_\s-]*speech\|>", " ", text)
 
-        for marker in blank_markers:
-            text = text.replace(marker, "")
-            text = text.replace(marker.lower(), "")
+        # If a line only had timestamps and a blank/no-speech marker, the
+        # marker removal can leave timestamp punctuation behind. Drop those
+        # remnants instead of showing them in the live transcript.
+        cleaned_lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if re.fullmatch(r"[\[\]\(\)\d:.,\-\s>]+", line):
+                continue
+            cleaned_lines.append(line)
 
-        return " ".join(text.split()).strip()
+        return " ".join(" ".join(cleaned_lines).split()).strip()
 
     def _transcribe(self, audio_file, allow_empty=False):
         if self.asr_backend == "fp16":
@@ -353,6 +356,7 @@ class InferencePipeline:
                     "-m", self.whisper_model_path,
                     "-f", temp_wav,
                     "-nt",
+                    "-sns",
                     "-otxt",
                     "-of", out_base,
                 ]
