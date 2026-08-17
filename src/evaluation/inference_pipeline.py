@@ -279,6 +279,8 @@ class InferencePipeline:
         import soundfile as sf
 
         audio_array = np.asarray(audio_array)
+        if audio_array.ndim > 1:
+            audio_array = audio_array.mean(axis=1)
         if audio_array.dtype.kind == "f":
             # float samples are expected in [-1, 1]
             audio_array = np.clip(audio_array, -1.0, 1.0)
@@ -297,10 +299,36 @@ class InferencePipeline:
             except OSError:
                 pass
 
+    def _clean_asr_transcript(self, transcript):
+        """Normalize whisper.cpp placeholder outputs from silent mic chunks."""
+        if not transcript:
+            return ""
+
+        text = str(transcript).strip()
+        blank_markers = {
+            "[BLANK_AUDIO]",
+            "(BLANK_AUDIO)",
+            "<|nospeech|>",
+            "<|no_speech|>",
+        }
+        if text.upper() in blank_markers:
+            return ""
+
+        for marker in blank_markers:
+            text = text.replace(marker, "")
+            text = text.replace(marker.lower(), "")
+
+        return " ".join(text.split()).strip()
+
     def _transcribe(self, audio_file, allow_empty=False):
         if self.asr_backend == "fp16":
             result = self.asr_pipe(audio_file)
-            return result["text"].strip()
+            transcript = self._clean_asr_transcript(result["text"])
+            if not transcript and not allow_empty:
+                error_msg = "Whisper ASR returned an empty transcript."
+                print(f"[ASR ERROR] {error_msg}", flush=True)
+                raise RuntimeError(error_msg)
+            return transcript
         else:
             # whisper.cpp's CLI only accepts 16kHz mono PCM WAV -- re-encode
             # whatever format we were handed (mp3, webm/opus mic chunks, etc.)
@@ -337,6 +365,7 @@ class InferencePipeline:
                     os.remove(out_txt)
                 if not transcript:
                     transcript = result.stdout.strip()
+                transcript = self._clean_asr_transcript(transcript)
 
                 if result.returncode != 0:
                     raise RuntimeError(f"whisper.cpp failed: {result.stderr[-1500:]}")

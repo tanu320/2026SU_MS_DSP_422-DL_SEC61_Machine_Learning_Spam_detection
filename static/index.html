@@ -328,7 +328,13 @@
         function recordCycle() {
             if (!isLive || !mediaStream) return;
             const chunks = [];
-            mediaRecorder = new MediaRecorder(mediaStream);
+            const recorderOptions = {};
+            if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                recorderOptions.mimeType = 'audio/webm;codecs=opus';
+            } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                recorderOptions.mimeType = 'audio/webm';
+            }
+            mediaRecorder = new MediaRecorder(mediaStream, recorderOptions);
             mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
             mediaRecorder.onstop = async () => {
                 if (chunks.length > 0) {

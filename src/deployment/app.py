@@ -101,7 +101,10 @@ def live_monitor(new_chunk, state):
         return state, "", _alert_html(None), f"Pipeline initialization failed: {pipeline_error}"
 
     sr, y = new_chunk
-    y = np.asarray(y).reshape(-1)
+    y = np.asarray(y)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    y = y.reshape(-1)
 
     if state is None or state.get("sr") != sr:
         state = {"buffer": np.zeros(0, dtype=y.dtype), "sr": sr, "transcript": "",
