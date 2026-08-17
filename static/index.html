@@ -143,7 +143,7 @@
             <div class="status" id="status-text"></div>
             <div class="transcript-box" id="transcript">Waiting for audio...</div>
             <div class="result-box" id="result"></div>
-            <button class="reset-btn" id="reset-btn" onclick="location.reload()">Upload Another File</button>
+            <button class="reset-btn" id="reset-btn" onclick="resetUpload()">Upload Another File</button>
         </div>
 
         <div class="tab-panel" id="tab-live">
@@ -244,6 +244,22 @@
                 status.style.color = "red";
             }
         });
+
+        function resetUpload() {
+            const input = document.getElementById('audio-upload');
+            const status = document.getElementById('status-text');
+            const transcriptBox = document.getElementById('transcript');
+            const resultBox = document.getElementById('result');
+            input.value = '';
+            status.innerText = '';
+            status.style.color = '';
+            transcriptBox.style.display = 'block';
+            transcriptBox.innerText = 'Waiting for audio...';
+            resultBox.style.display = 'none';
+            resultBox.innerText = '';
+            resultBox.className = 'result-box';
+            document.getElementById('reset-btn').style.display = 'none';
+        }
 
         // ---- Tabs ----
         function switchTab(name) {

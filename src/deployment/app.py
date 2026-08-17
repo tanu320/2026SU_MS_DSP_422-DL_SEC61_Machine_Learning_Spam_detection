@@ -149,6 +149,9 @@ def live_monitor(new_chunk, state):
 def reset_live_state():
     return None, "", _alert_html(None), "Idle — start recording to begin monitoring."
 
+def reset_upload_state():
+    return None, "", "", ""
+
 # Build Gradio UI
 with gr.Blocks(title="Scam Detection AI", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# Scam Detection AI")
@@ -161,7 +164,9 @@ with gr.Blocks(title="Scam Detection AI", theme=gr.themes.Soft()) as demo:
             with gr.Row():
                 with gr.Column():
                     audio_input = gr.Audio(type="filepath", label="Upload Audio Call (.wav, .mp3)")
-                    analyze_btn = gr.Button("Analyze Intent", variant="primary")
+                    with gr.Row():
+                        analyze_btn = gr.Button("Analyze Intent", variant="primary")
+                        clear_upload_btn = gr.Button("Clear")
 
                 with gr.Column():
                     prediction_output = gr.Textbox(label="AI Prediction (Scam vs Legitimate)", lines=1)
@@ -172,6 +177,11 @@ with gr.Blocks(title="Scam Detection AI", theme=gr.themes.Soft()) as demo:
                 fn=process_audio,
                 inputs=audio_input,
                 outputs=[transcript_output, prediction_output, latency_output]
+            )
+            clear_upload_btn.click(
+                fn=reset_upload_state,
+                inputs=None,
+                outputs=[audio_input, transcript_output, prediction_output, latency_output],
             )
 
         with gr.Tab("🔴 Live Call Monitor"):
