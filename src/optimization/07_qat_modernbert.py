@@ -130,6 +130,13 @@ if __name__ == "__main__":
     # 3. ACTUAL QAT TRAINING LOOP
     print("\n--- Starting Quantization-Aware Training (1 Epoch) ---")
     
+    # [BUG FIX]: Kaggle kernels often provide two GPUs (e.g. T4x2). HuggingFace Trainer
+    # automatically wraps the model in nn.DataParallel if it detects multiple GPUs.
+    # PyTorch QAT FakeQuantize buffers DO NOT survive DataParallel scattering/gathering,
+    # which corrupts the Linear observers into returning NaN. We MUST force a single GPU.
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    
     # Locate the downloaded dataset (it was logged as a CSV in MLflow)
     import pandas as pd
     from datasets import Dataset
