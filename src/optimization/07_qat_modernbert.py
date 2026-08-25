@@ -177,7 +177,16 @@ if __name__ == "__main__":
         return tokenizer(batch["text"], truncation=True, max_length=512)
     
     dataset = dataset.map(tokenize_fn, batched=True)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    
+    # [BUG FIX]: HuggingFace Trainer normally auto-removes raw string columns (like 'text').
+    # Since we are using a pure PyTorch DataLoader, we must manually strip those non-tensor 
+    # columns, otherwise DataCollator crashes trying to turn strings into tensors!
+    cols_to_keep = ["input_ids", "attention_mask", "label", "labels"]
+    cols_to_remove = [c for c in dataset.column_names if c not in cols_to_keep]
+    dataset = dataset.remove_columns(cols_to_remove)
+    dataset.set_format("torch")
+    
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
     
     # [BUG FIX]: HuggingFace Trainer aggressively forces Automatic Mixed Precision (AMP) 
     # and DataParallel under the hood on Kaggle T4x2 environments, which corrupts 
