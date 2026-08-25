@@ -113,6 +113,10 @@ def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"
             
     clean_export_model = ONNXWrapper(quantized_model)
     clean_export_model.eval()
+    
+    # [BUG FIX]: The model is still on cuda:0 from the training loop, but the ONNX dummy
+    # inputs are on the CPU! We must move the model back to the CPU to avoid device mismatch.
+    clean_export_model.cpu()
 
     # Move dummy inputs to the same device as the model (CPU for export)
     dummy_input = torch.randint(0, 1000, (1, 128), dtype=torch.long)
