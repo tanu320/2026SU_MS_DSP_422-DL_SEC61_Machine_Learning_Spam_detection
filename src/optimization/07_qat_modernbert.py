@@ -61,7 +61,15 @@ def configure_qat(model_path: str):
     Sets up the ModernBERT model for Quantization-Aware Training (QAT).
     """
     print(f"Loading Phase 2 Model for QAT: {model_path}")
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    # [BUG FIX]: ModernBERT often defaults to Flash Attention (which requires FP16) or BFloat16.
+    # Since QAT strictly requires FP32, Flash Attention will overflow and output NaNs. 
+    # We MUST force "eager" attention and strict FP32 math.
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_path,
+        num_labels=2,
+        attn_implementation="eager",
+        torch_dtype=torch.float32
+    ).float()
     
     # Set model to training mode (required for QAT)
     model.train()
@@ -222,6 +230,11 @@ if __name__ == "__main__":
         loss = outputs.loss
         
         loss.backward()
+        
+        # [BUG FIX]: ModernBERT's GeGLU layers create massive activation outliers.
+        # We MUST clip the gradients, otherwise the loss instantly explodes to NaN!
+        torch.nn.utils.clip_grad_norm_(qat_model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         optimizer.zero_grad()
         
