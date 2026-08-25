@@ -179,32 +179,45 @@ if __name__ == "__main__":
     dataset = dataset.map(tokenize_fn, batched=True)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     
-    training_args = TrainingArguments(
-        output_dir="./qat_checkpoints",
-        num_train_epochs=1,          # 1 epoch is sufficient for QAT weight adjustment
-        per_device_train_batch_size=16,
-        learning_rate=2e-5,          # Very low learning rate so we don't destroy Phase 2 knowledge
-        logging_steps=50,
-        save_strategy="no",          # We only care about the final ONNX export
-        report_to="none",
+    # [BUG FIX]: HuggingFace Trainer aggressively forces Automatic Mixed Precision (AMP) 
+    # and DataParallel under the hood on Kaggle T4x2 environments, which corrupts 
+    # QAT FakeQuantize buffers into NaNs. We MUST use a pure PyTorch training loop to 
+    # guarantee pristine FP32 math on a single GPU.
+    
+    from torch.utils.data import DataLoader
+    from transformers import default_data_collator
+    
+    # Ensure data collator formats to PyTorch tensors
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=8, 
+        shuffle=True, 
+        collate_fn=data_collator
+    )
+    
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    qat_model.to(device)
+    qat_model.train()
+    
+    optimizer = torch.optim.AdamW(qat_model.parameters(), lr=2e-5)
+    
+    print(f"Executing pure PyTorch QAT loop on {device} (Bypassing HF Trainer)...")
+    
+    for step, batch in enumerate(dataloader):
+        batch = {k: v.to(device) for k, v in batch.items()}
         
-        # [BUG FIX]: QAT FakeQuantize observers CANNOT handle Automatic Mixed Precision (AMP/FP16).
-        # We must strictly enforce FP32 (32-bit floats) during QAT training, otherwise the 
-        # observers overflow and return NaN for the Linear attention layers!
-        fp16=False,
-        bf16=False,
-    )
-    
-    trainer = Trainer(
-        model=qat_model,
-        args=training_args,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-    
-    print("Executing Trainer.train() with FakeQuantize nodes active...")
-    trainer.train()
+        # Pure FP32 forward pass (NO AMP!)
+        outputs = qat_model(**batch)
+        loss = outputs.loss
+        
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        if step % 10 == 0:
+            print(f"  Step {step}/{len(dataloader)} - Loss: {loss.item():.4f}")
     
     # 4. Export
     print("\n--- Training Complete! Proceeding to Export ---")
