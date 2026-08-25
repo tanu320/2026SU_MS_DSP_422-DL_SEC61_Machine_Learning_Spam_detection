@@ -35,8 +35,22 @@ def fetch_model_from_dagshub(run_id: str, download_dir: str):
         print(f"  Downloading {artifact.path}...")
         client.download_artifacts(run_id, artifact.path, download_dir)
         
-    print(f"Model successfully downloaded to: {download_dir}")
-    return download_dir
+    print(f"Artifacts successfully downloaded to: {download_dir}")
+    
+    # MLflow often nests the model inside subdirectories (e.g. 05_transcript_modernbert/scam-classifier...)
+    # We must dynamically search the downloads folder for the exact location of config.json
+    model_path = None
+    for root, dirs, files in os.walk(download_dir):
+        if "config.json" in files and "model.safetensors" in files:
+            model_path = root
+            break
+            
+    if model_path is None:
+        print("[ERROR] Could not find a valid HuggingFace model (config.json) in the downloaded artifacts!")
+        exit(1)
+        
+    print(f"Found HuggingFace Model Weights at: {model_path}")
+    return model_path
 
 def configure_qat(model_path: str):
     """
