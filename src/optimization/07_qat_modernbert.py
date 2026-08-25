@@ -182,7 +182,13 @@ if __name__ == "__main__":
         learning_rate=2e-5,          # Very low learning rate so we don't destroy Phase 2 knowledge
         logging_steps=50,
         save_strategy="no",          # We only care about the final ONNX export
-        report_to="none"
+        report_to="none",
+        
+        # [BUG FIX]: QAT FakeQuantize observers CANNOT handle Automatic Mixed Precision (AMP/FP16).
+        # We must strictly enforce FP32 (32-bit floats) during QAT training, otherwise the 
+        # observers overflow and return NaN for the Linear attention layers!
+        fp16=False,
+        bf16=False,
     )
     
     trainer = Trainer(
