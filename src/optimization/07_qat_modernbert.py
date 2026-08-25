@@ -67,15 +67,15 @@ def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"
 if __name__ == "__main__":
     print("=== Android QAT Setup Script ===")
     
-    # Example workflow:
     # 1. Fetch the Phase 2 model from DagsHub
-    # RUN_ID = "your_phase2_mlflow_run_id" 
-    # local_model_dir = fetch_model_from_dagshub(RUN_ID, "scam-classifier-model-transcript-lora", "./downloads")
+    RUN_ID = "62ffeee7d6d446babb855d5c4af082ce" 
+    local_model_dir = fetch_model_from_dagshub(RUN_ID, "scam-classifier-model-transcript-lora", "./downloads")
     
     # 2. Configure QAT
-    # qat_model = configure_qat(local_model_dir)
+    qat_model = configure_qat(local_model_dir)
     
     # 3. ---> RUN YOUR PYTORCH TRAINING LOOP HERE FOR 1 EPOCH ON PHASE 2 DATA <---
+    print("\n[!] Please insert your Phase 2 dataset loading and Trainer.train() loop here before exporting!\n")
     
     # 4. Export
     # export_qat_to_android(qat_model)
