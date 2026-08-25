@@ -5,9 +5,9 @@ import torch.quantization
 import mlflow
 import os
 
-def fetch_model_from_dagshub(run_id: str, artifact_path: str, download_dir: str):
+def fetch_model_from_dagshub(run_id: str, download_dir: str):
     """
-    Downloads the Phase 2 (Transcript Retrained) model from DagsHub MLflow.
+    Downloads the Phase 2 (Transcript Retrained) model from DagsHub MLflow root.
     """
     print(f"Fetching Phase 2 model from MLflow (Run ID: {run_id})...")
     
@@ -24,24 +24,19 @@ def fetch_model_from_dagshub(run_id: str, artifact_path: str, download_dir: str)
     # Ensure the download directory exists before downloading
     os.makedirs(download_dir, exist_ok=True)
     
-    # Robust file-by-file download to bypass DagsHub 500 timeout on large directory zipping
-    def download_recursive(path, dest_dir):
-        artifacts = client.list_artifacts(run_id, path)
-        for artifact in artifacts:
-            if artifact.is_dir:
-                # If there are checkpoints, we only really need the final model files.
-                # However, to be safe, we will recursively download all dirs
-                download_recursive(artifact.path, dest_dir)
-            else:
-                print(f"  Downloading {artifact.path}...")
-                client.download_artifacts(run_id, artifact.path, dest_dir)
-                
-    print("Starting robust file-by-file download...")
-    download_recursive(artifact_path, download_dir)
+    print("Listing artifacts in the root of the MLflow run...")
+    artifacts = client.list_artifacts(run_id, "")
     
-    local_path = os.path.join(download_dir, artifact_path)
-    print(f"Model successfully downloaded to: {local_path}")
-    return local_path
+    if not artifacts:
+        print("[ERROR] No artifacts found in this run! Please verify the Run ID.")
+        exit(1)
+        
+    for artifact in artifacts:
+        print(f"  Downloading {artifact.path}...")
+        client.download_artifacts(run_id, artifact.path, download_dir)
+        
+    print(f"Model successfully downloaded to: {download_dir}")
+    return download_dir
 
 def configure_qat(model_path: str):
     """
@@ -95,17 +90,16 @@ if __name__ == "__main__":
     local_model_dir = f"./{local_model_name}"
     
     # Check if the model is already sitting on the Kaggle server locally
-    if os.path.exists(local_model_dir):
+    if os.path.exists(local_model_dir) and os.path.exists(os.path.join(local_model_dir, "config.json")):
         print(f"Found local model at {local_model_dir}! Bypassing DagsHub download.")
     else:
         print(f"Local model not found. Attempting to fetch from DagsHub MLflow...")
         try:
             RUN_ID = "62ffeee7d6d446babb855d5c4af082ce" 
-            local_model_dir = fetch_model_from_dagshub(RUN_ID, local_model_name, "./downloads")
+            local_model_dir = fetch_model_from_dagshub(RUN_ID, "./downloads")
         except Exception as e:
             print(f"\n[ERROR] MLflow Download Failed: {e}")
-            print("DagsHub servers might be experiencing a 500 timeout, or your Kaggle server is missing the MLFLOW_TRACKING_USERNAME and MLFLOW_TRACKING_PASSWORD environment variables.")
-            print(f"Please either set those credentials, or manually ensure the '{local_model_name}' folder is uploaded to your Kaggle working directory.\n")
+            print("DagsHub servers might be experiencing a 500 timeout, or your Kaggle server is missing credentials.")
             exit(1)
             
     # 2. Configure QAT
