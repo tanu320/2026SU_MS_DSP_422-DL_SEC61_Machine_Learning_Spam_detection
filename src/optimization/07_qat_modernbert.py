@@ -99,14 +99,28 @@ def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"
     quantized_model = torch.quantization.convert(qat_model, inplace=False)
     
     print(f"Exporting INT8 model to {output_onnx_path}...")
-    dummy_input = {
-        "input_ids": torch.randint(0, 30000, (1, 128)),
-        "attention_mask": torch.ones(1, 128)
-    }
+    # [BUG FIX]: HuggingFace models return complex dictionaries or Tuples filled with None values 
+    # (for hidden states, past keys, etc.). PyTorch JIT Tracer absolutely hates NoneTypes and crashes.
+    # We MUST wrap the model in a clean dummy module that only returns the mathematical logits Tensor.
+    class ONNXWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            
+        def forward(self, input_ids, attention_mask):
+            # Extract just the logits Tensor to keep the ONNX graph clean
+            return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+            
+    clean_export_model = ONNXWrapper(quantized_model)
+    clean_export_model.eval()
+
+    # Move dummy inputs to the same device as the model (CPU for export)
+    dummy_input = torch.randint(0, 1000, (1, 128), dtype=torch.long)
+    dummy_mask = torch.ones((1, 128), dtype=torch.long)
     
     torch.onnx.export(
-        quantized_model, 
-        (dummy_input["input_ids"], dummy_input["attention_mask"]),
+        clean_export_model, 
+        (dummy_input, dummy_mask),
         output_onnx_path,
         export_params=True,
         opset_version=14,
