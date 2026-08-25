@@ -76,10 +76,23 @@ def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"
 if __name__ == "__main__":
     print("=== Android QAT Setup Script ===")
     
-    # 1. Fetch the Phase 2 model from DagsHub
-    RUN_ID = "62ffeee7d6d446babb855d5c4af082ce" 
-    local_model_dir = fetch_model_from_dagshub(RUN_ID, "scam-classifier-model-transcript-lora", "./downloads")
+    local_model_name = "scam-classifier-model-transcript-lora"
+    local_model_dir = f"./{local_model_name}"
     
+    # Check if the model is already sitting on the Kaggle server locally
+    if os.path.exists(local_model_dir):
+        print(f"Found local model at {local_model_dir}! Bypassing DagsHub download.")
+    else:
+        print(f"Local model not found. Attempting to fetch from DagsHub MLflow...")
+        try:
+            RUN_ID = "62ffeee7d6d446babb855d5c4af082ce" 
+            local_model_dir = fetch_model_from_dagshub(RUN_ID, local_model_name, "./downloads")
+        except Exception as e:
+            print(f"\n[ERROR] MLflow Download Failed: {e}")
+            print("DagsHub servers might be experiencing a 500 timeout, or your Kaggle server is missing the MLFLOW_TRACKING_USERNAME and MLFLOW_TRACKING_PASSWORD environment variables.")
+            print(f"Please either set those credentials, or manually ensure the '{local_model_name}' folder is uploaded to your Kaggle working directory.\n")
+            exit(1)
+            
     # 2. Configure QAT
     qat_model = configure_qat(local_model_dir)
     
