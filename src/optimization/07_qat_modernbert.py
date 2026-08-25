@@ -91,16 +91,14 @@ def configure_qat(model_path: str):
     return model
 
 def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"):
-    """
-    Converts the fake-quantized model to true INT8 and exports to ONNX.
-    """
-    print("Converting FakeQuantize model to pure INT8...")
+    # [BUG FIX]: In PyTorch QAT, you do NOT call .convert() before exporting to ONNX!
+    # If you call .convert(), PyTorch turns it into a native QNNPACK model, which 
+    # ONNX cannot trace (causing the quantized::linear CPU backend crash).
+    # Instead, we export the model WHILE it still has FakeQuantize nodes. The ONNX 
+    # exporter translates those nodes into the industry-standard QDQ (Quantize-Dequantize) format.
+    print(f"Exporting QAT model to {output_onnx_path} in QDQ format...")
     qat_model.eval()
-    quantized_model = torch.quantization.convert(qat_model, inplace=False)
     
-    print(f"Exporting INT8 model to {output_onnx_path}...")
-    # [BUG FIX]: HuggingFace models return complex dictionaries or Tuples filled with None values 
-    # (for hidden states, past keys, etc.). PyTorch JIT Tracer absolutely hates NoneTypes and crashes.
     # We MUST wrap the model in a clean dummy module that only returns the mathematical logits Tensor.
     class ONNXWrapper(torch.nn.Module):
         def __init__(self, model):
@@ -111,7 +109,7 @@ def export_qat_to_android(qat_model, output_onnx_path="modernbert_qat_int8.onnx"
             # Extract just the logits Tensor to keep the ONNX graph clean
             return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
             
-    clean_export_model = ONNXWrapper(quantized_model)
+    clean_export_model = ONNXWrapper(qat_model)
     clean_export_model.eval()
     
     # [BUG FIX]: The model is still on cuda:0 from the training loop, but the ONNX dummy
