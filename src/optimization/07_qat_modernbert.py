@@ -66,11 +66,11 @@ def configure_qat(model_path: str):
     model.qconfig = torch.quantization.get_default_qat_qconfig('qnnpack')
     
     # [BUG FIX]: PyTorch FakeQuantize observers often return NaN for Embeddings 
-    # because of sparsity during the 1-epoch QAT run. The industry standard fix 
-    # is to completely disable quantization for Embedding layers. They take up 
+    # and LayerNorms because of sparsity during the 1-epoch QAT run. The industry standard fix 
+    # is to completely disable quantization for Embedding and Normalization layers. They take up 
     # very little space compared to the Linear attention layers anyway!
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Embedding):
+        if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
             module.qconfig = None
             
     print("Injecting FakeQuantize nodes into PyTorch graph for QAT...")
