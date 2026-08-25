@@ -122,24 +122,50 @@ if __name__ == "__main__":
     # 3. ACTUAL QAT TRAINING LOOP
     print("\n--- Starting Quantization-Aware Training (1 Epoch) ---")
     
-    # Locate the downloaded dataset
-    import datasets
-    from transformers import Trainer, TrainingArguments, AutoTokenizer
+    # Locate the downloaded dataset (it was logged as a CSV in MLflow)
+    import pandas as pd
+    from datasets import Dataset
+    from transformers import Trainer, TrainingArguments, AutoTokenizer, DataCollatorWithPadding
     
-    dataset_path = None
+    csv_path = None
     for root, dirs, files in os.walk("./downloads"):
-        if "dataset_info.json" in files or "state.json" in files:
-            dataset_path = root
+        for file in files:
+            if file.endswith(".csv") and "train" in file.lower():
+                csv_path = os.path.join(root, file)
+                break
+        if csv_path:
             break
             
-    if dataset_path is None:
-        print("[ERROR] Could not find the dataset in the downloaded artifacts!")
+    if csv_path is None:
+        # Fallback to test/any csv if train isn't specifically named
+        for root, dirs, files in os.walk("./downloads"):
+            for file in files:
+                if file.endswith(".csv"):
+                    csv_path = os.path.join(root, file)
+                    break
+            if csv_path:
+                break
+
+    if csv_path is None:
+        print("[ERROR] Could not find any .csv dataset in the downloaded artifacts!")
         exit(1)
         
-    print(f"Loading Phase 2 Dataset from: {dataset_path}")
-    dataset = datasets.load_from_disk(dataset_path)
+    print(f"Loading Phase 2 Dataset from CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
+    
+    # We only need a small sample (e.g. 500 rows) for QAT to adjust weights, no need to train on the whole thing!
+    # This prevents the QAT loop from taking hours on Kaggle.
+    df = df.sample(n=min(500, len(df)), random_state=42).reset_index(drop=True)
+    dataset = Dataset.from_pandas(df)
     
     tokenizer = AutoTokenizer.from_pretrained(local_model_dir)
+    
+    print("Tokenizing dataset...")
+    def tokenize_fn(batch):
+        return tokenizer(batch["text"], truncation=True, max_length=512)
+    
+    dataset = dataset.map(tokenize_fn, batched=True)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     
     training_args = TrainingArguments(
         output_dir="./qat_checkpoints",
@@ -154,8 +180,9 @@ if __name__ == "__main__":
     trainer = Trainer(
         model=qat_model,
         args=training_args,
-        train_dataset=dataset["train"] if "train" in dataset else dataset,
+        train_dataset=dataset,
         tokenizer=tokenizer,
+        data_collator=data_collator,
     )
     
     print("Executing Trainer.train() with FakeQuantize nodes active...")
