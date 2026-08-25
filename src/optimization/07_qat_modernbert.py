@@ -11,8 +11,13 @@ def fetch_model_from_dagshub(run_id: str, artifact_path: str, download_dir: str)
     """
     print(f"Fetching Phase 2 model from MLflow (Run ID: {run_id})...")
     
-    # Ensure credentials are set in the environment or .env
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "https://dagshub.com/your-owner/your-repo.mlflow"))
+    # Load environment variables from .env if present
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    # Ensure credentials are set in the environment or fallback to your specific repo
+    default_uri = "https://dagshub.com/kureeltanishq/2026SU_MS_DSP_422-DL_SEC61_Machine_Learning_Spam_detection.mlflow"
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", default_uri))
     
     client = mlflow.tracking.MlflowClient()
     local_path = client.download_artifacts(run_id, artifact_path, download_dir)
