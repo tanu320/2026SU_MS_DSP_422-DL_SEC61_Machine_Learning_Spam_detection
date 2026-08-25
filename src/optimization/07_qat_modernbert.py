@@ -119,10 +119,50 @@ if __name__ == "__main__":
     # 2. Configure QAT
     qat_model = configure_qat(local_model_dir)
     
-    # 3. ---> RUN YOUR PYTORCH TRAINING LOOP HERE FOR 1 EPOCH ON PHASE 2 DATA <---
-    print("\n[!] Please insert your Phase 2 dataset loading and Trainer.train() loop here before exporting!\n")
+    # 3. ACTUAL QAT TRAINING LOOP
+    print("\n--- Starting Quantization-Aware Training (1 Epoch) ---")
+    
+    # Locate the downloaded dataset
+    import datasets
+    from transformers import Trainer, TrainingArguments, AutoTokenizer
+    
+    dataset_path = None
+    for root, dirs, files in os.walk("./downloads"):
+        if "dataset_info.json" in files or "state.json" in files:
+            dataset_path = root
+            break
+            
+    if dataset_path is None:
+        print("[ERROR] Could not find the dataset in the downloaded artifacts!")
+        exit(1)
+        
+    print(f"Loading Phase 2 Dataset from: {dataset_path}")
+    dataset = datasets.load_from_disk(dataset_path)
+    
+    tokenizer = AutoTokenizer.from_pretrained(local_model_dir)
+    
+    training_args = TrainingArguments(
+        output_dir="./qat_checkpoints",
+        num_train_epochs=1,          # 1 epoch is sufficient for QAT weight adjustment
+        per_device_train_batch_size=16,
+        learning_rate=2e-5,          # Very low learning rate so we don't destroy Phase 2 knowledge
+        logging_steps=50,
+        save_strategy="no",          # We only care about the final ONNX export
+        report_to="none"
+    )
+    
+    trainer = Trainer(
+        model=qat_model,
+        args=training_args,
+        train_dataset=dataset["train"] if "train" in dataset else dataset,
+        tokenizer=tokenizer,
+    )
+    
+    print("Executing Trainer.train() with FakeQuantize nodes active...")
+    trainer.train()
     
     # 4. Export
-    # export_qat_to_android(qat_model)
+    print("\n--- Training Complete! Proceeding to Export ---")
+    export_qat_to_android(qat_model)
 
 
