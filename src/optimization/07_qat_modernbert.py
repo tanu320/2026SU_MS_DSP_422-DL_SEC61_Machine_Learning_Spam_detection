@@ -1,9 +1,13 @@
+import os
+# [BUG FIX]: PyTorch reads CUDA_VISIBLE_DEVICES during initialization. We MUST force a single GPU
+# before importing torch, otherwise it will use DataParallel on Kaggle T4x2 and corrupt the QAT buffers!
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import torch.quantization
 import mlflow
-import os
 
 def fetch_model_from_dagshub(run_id: str, download_dir: str):
     """
@@ -129,13 +133,6 @@ if __name__ == "__main__":
     
     # 3. ACTUAL QAT TRAINING LOOP
     print("\n--- Starting Quantization-Aware Training (1 Epoch) ---")
-    
-    # [BUG FIX]: Kaggle kernels often provide two GPUs (e.g. T4x2). HuggingFace Trainer
-    # automatically wraps the model in nn.DataParallel if it detects multiple GPUs.
-    # PyTorch QAT FakeQuantize buffers DO NOT survive DataParallel scattering/gathering,
-    # which corrupts the Linear observers into returning NaN. We MUST force a single GPU.
-    import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
     # Locate the downloaded dataset (it was logged as a CSV in MLflow)
     import pandas as pd
