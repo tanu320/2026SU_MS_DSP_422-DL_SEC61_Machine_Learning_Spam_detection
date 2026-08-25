@@ -20,6 +20,10 @@ def fetch_model_from_dagshub(run_id: str, artifact_path: str, download_dir: str)
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", default_uri))
     
     client = mlflow.tracking.MlflowClient()
+    
+    # Ensure the download directory exists before downloading
+    os.makedirs(download_dir, exist_ok=True)
+    
     local_path = client.download_artifacts(run_id, artifact_path, download_dir)
     print(f"Model successfully downloaded to: {local_path}")
     return local_path
