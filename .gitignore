@@ -72,3 +72,4 @@ kubeconfig*
 *.pptx
 *.csv
 llama.cpp/
+docs/
