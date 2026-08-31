@@ -12,7 +12,8 @@ MODERNBERT_MODEL_NAME ?= answerdotai/ModernBERT-base
 	build-data build-data-no-mlflow \
 	validate-data data data-no-mlflow \
 	train-distilbert train-modernbert train-modernbert-lora train-modernbert-full \
-	train-transcript train-transcript-lora quantize evaluate all
+	train-transcript train-transcript-lora quantize evaluate all \
+	android-eval-manifest android-server-baseline android-compare android-qat-export
 
 download-data:
 	$(PYTHON) src/data/00_download_raw_data.py
@@ -69,6 +70,20 @@ evaluate: quantize
 	$(PYTHON) src/evaluation/07_whisper_quant_benchmark.py
 	$(PYTHON) src/evaluation/08_combo_benchmark.py
 	$(PYTHON) src/evaluation/09_best_pipeline_selection.py
+
+android-eval-manifest:
+	$(PYTHON) src/evaluation/10_prepare_android_eval_manifest.py
+
+android-server-baseline:
+	$(PYTHON) src/evaluation/11_benchmark_server_baseline.py
+
+android-compare:
+	$(PYTHON) src/evaluation/12_compare_android_server_results.py
+
+android-qat-export:
+	$(PYTHON) src/optimization/07_qat_modernbert.py \
+		--model_dir $(TRANSCRIPT_OUTPUT_DIR) \
+		--output_dir models/android
 
 all:
 	bash run_pipeline.sh
