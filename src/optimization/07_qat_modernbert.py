@@ -560,7 +560,7 @@ class LogitsWrapper(torch.nn.Module):
         return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
 
 
-def export_int8_onnx(
+def export_android_onnx_variants(
     qat_model,
     model_dir: Path,
     tokenizer,
@@ -574,7 +574,6 @@ def export_int8_onnx(
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     fp32_path = output_dir / "modernbert_qat_fp32.onnx"
-    int8_path = output_dir / "modernbert_qat_int8.onnx"
 
     clean_model = copy_qat_weights_to_clean_model(
         qat_model,
@@ -613,18 +612,76 @@ def export_int8_onnx(
 
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
-    quantize_dynamic(
-        model_input=str(fp32_path),
-        model_output=str(int8_path),
-        weight_type=QuantType.QInt8,
-        per_channel=True,
-        op_types_to_quantize=["MatMul"],
-    )
+    quantized_variants = [
+        {
+            "name": "onnx_int8_qint8_per_channel",
+            "path": output_dir / "modernbert_qat_int8_qint8_per_channel.onnx",
+            "weight_type": QuantType.QInt8,
+            "per_channel": True,
+            "op_types_to_quantize": ["MatMul"],
+        },
+        {
+            "name": "onnx_int8_qint8_per_tensor",
+            "path": output_dir / "modernbert_qat_int8_qint8_per_tensor.onnx",
+            "weight_type": QuantType.QInt8,
+            "per_channel": False,
+            "op_types_to_quantize": ["MatMul"],
+        },
+        {
+            "name": "onnx_int8_quint8_per_tensor",
+            "path": output_dir / "modernbert_qat_int8_quint8_per_tensor.onnx",
+            "weight_type": QuantType.QUInt8,
+            "per_channel": False,
+            "op_types_to_quantize": ["MatMul"],
+        },
+    ]
+    produced_variants = {
+        "onnx_fp32": {
+            "path": fp32_path,
+            "size_mb": fp32_path.stat().st_size / (1024 * 1024),
+            "quantized": False,
+            "quantization": "none",
+        }
+    }
+    for variant in quantized_variants:
+        try:
+            quantize_dynamic(
+                model_input=str(fp32_path),
+                model_output=str(variant["path"]),
+                weight_type=variant["weight_type"],
+                per_channel=variant["per_channel"],
+                op_types_to_quantize=variant["op_types_to_quantize"],
+            )
+            produced_variants[variant["name"]] = {
+                "path": variant["path"],
+                "size_mb": variant["path"].stat().st_size / (1024 * 1024),
+                "quantized": True,
+                "quantization": variant["name"],
+            }
+        except Exception as exc:
+            print(f"[WARN] Could not export {variant['name']}: {exc}")
 
     tokenizer.save_pretrained(output_dir)
+    export_metrics = {
+        "fp32_onnx_path": str(fp32_path),
+        "fp32_size_mb": fp32_path.stat().st_size / (1024 * 1024),
+    }
+    for name, variant in produced_variants.items():
+        export_metrics[f"{name}_path"] = str(variant["path"])
+        export_metrics[f"{name}_size_mb"] = float(variant["size_mb"])
+        export_metrics[f"{name}_quantized"] = bool(variant["quantized"])
+    return {"variants": produced_variants, "metrics": export_metrics}
+
+
+def write_android_manifest(output_dir: Path, selected_variant: dict, variant_results: list[dict]) -> None:
     manifest = {
-        "classifier_model": int8_path.name,
-        "fp32_reference_model": fp32_path.name,
+        "classifier_model": Path(selected_variant["path"]).name,
+        "selected_variant": selected_variant["variant"],
+        "selected_accuracy": selected_variant["accuracy"],
+        "selected_f1": selected_variant["f1"],
+        "selected_latency_ms_mean": selected_variant["latency_ms_mean"],
+        "selected_size_mb": selected_variant["size_mb"],
+        "fp32_reference_model": "modernbert_qat_fp32.onnx",
         "tokenizer_files": ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
         "contract": {
             "inputs": ["input_ids:int64[batch,seq]", "attention_mask:int64[batch,seq]"],
@@ -632,14 +689,10 @@ def export_int8_onnx(
             "scam_probability": "softmax(logits)[1]",
         },
         "android_runtime": "onnxruntime-android with NNAPI requested and CPU fallback",
+        "selection_policy": "highest accuracy passing the smoke threshold, then lower latency, then lower size",
+        "all_variant_results": variant_results,
     }
     (output_dir / "model_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return {
-        "fp32_onnx_path": str(fp32_path),
-        "int8_onnx_path": str(int8_path),
-        "fp32_size_mb": fp32_path.stat().st_size / (1024 * 1024),
-        "int8_size_mb": int8_path.stat().st_size / (1024 * 1024),
-    }
 
 
 def evaluate_onnx_model(onnx_path: str, tokenizer, sample: pd.DataFrame, max_length: int, prefix: str) -> dict:
@@ -727,7 +780,12 @@ def parse_args():
         "--min_smoke_accuracy",
         type=float,
         default=0.90,
-        help="Fail the export if INT8 ONNX accuracy on the held-out smoke sample is below this value.",
+        help="Fail the export if no ONNX variant reaches this held-out smoke accuracy.",
+    )
+    parser.add_argument(
+        "--require_quantized",
+        action="store_true",
+        help="Fail unless the selected Android ONNX asset is a quantized variant.",
     )
     parser.add_argument("--skip_mlflow", action="store_true")
     parser.add_argument(
@@ -802,7 +860,7 @@ def main():
         )
         post_qat_metrics = evaluate_torch_model(qat_model, tokenizer, eval_sample, args.max_length, "torch_post_qat")
 
-    export_metrics = export_int8_onnx(
+    export_result = export_android_onnx_variants(
         qat_model,
         model_dir,
         tokenizer,
@@ -814,40 +872,86 @@ def main():
         base_model_experiment=args.base_model_experiment,
         base_download_dir=args.base_download_dir,
     )
-    fp32_onnx_metrics = evaluate_onnx_model(
-        export_metrics["fp32_onnx_path"],
-        tokenizer,
-        eval_sample,
-        args.max_length,
-        "onnx_fp32",
+    export_metrics = export_result["metrics"]
+
+    variant_results = []
+    variant_metrics = {}
+    for variant_name, variant in export_result["variants"].items():
+        result = evaluate_onnx_model(
+            str(variant["path"]),
+            tokenizer,
+            eval_sample,
+            args.max_length,
+            variant_name,
+        )
+        accuracy = float(result[f"{variant_name}_accuracy"])
+        f1 = float(result[f"{variant_name}_f1"])
+        latency = float(result[f"{variant_name}_latency_ms_mean"])
+        size_mb = float(variant["size_mb"])
+        variant_record = {
+            "variant": variant_name,
+            "path": str(variant["path"]),
+            "quantized": bool(variant["quantized"]),
+            "accuracy": accuracy,
+            "f1": f1,
+            "latency_ms_mean": latency,
+            "size_mb": size_mb,
+        }
+        variant_results.append(variant_record)
+        variant_metrics.update(result)
+
+    variant_results = sorted(
+        variant_results,
+        key=lambda row: (row["accuracy"], -row["latency_ms_mean"], -row["size_mb"]),
+        reverse=True,
     )
-    int8_onnx_metrics = evaluate_onnx_model(
-        export_metrics["int8_onnx_path"],
-        tokenizer,
-        eval_sample,
-        args.max_length,
-        "onnx_int8",
-    )
+    passing_variants = [row for row in variant_results if row["accuracy"] >= args.min_smoke_accuracy]
+    if args.require_quantized:
+        passing_variants = [row for row in passing_variants if row["quantized"]]
 
     metrics = {
         **pre_qat_metrics,
         **qat_metrics,
         **post_qat_metrics,
         **export_metrics,
-        **fp32_onnx_metrics,
-        **int8_onnx_metrics,
+        **variant_metrics,
     }
     print(json.dumps(metrics, indent=2))
-
-    int8_accuracy = float(int8_onnx_metrics["onnx_int8_accuracy"])
-    if int8_accuracy < args.min_smoke_accuracy:
-        raise RuntimeError(
-            "Android INT8 export failed quality gate: "
-            f"onnx_int8_accuracy={int8_accuracy:.4f} < min_smoke_accuracy={args.min_smoke_accuracy:.4f}. "
-            "Inspect torch_pre_qat_accuracy, torch_post_qat_accuracy, onnx_fp32_accuracy, and "
-            "onnx_int8_accuracy above to locate the degradation point. Try --skip_qat_training "
-            "to test plain dynamic INT8 export before accepting Android assets."
+    print("\n--- Android ONNX Variant Results ---")
+    for row in variant_results:
+        print(
+            f"{row['variant']}: acc={row['accuracy']:.4f}, f1={row['f1']:.4f}, "
+            f"latency={row['latency_ms_mean']:.1f} ms, size={row['size_mb']:.1f} MB, "
+            f"quantized={row['quantized']}"
         )
+
+    pd.DataFrame(variant_results).to_csv(Path(args.output_dir) / "android_onnx_variant_results.csv", index=False)
+
+    if not passing_variants:
+        best = variant_results[0] if variant_results else {}
+        raise RuntimeError(
+            "Android ONNX export failed quality gate: "
+            f"best_variant={best.get('variant', 'none')} "
+            f"accuracy={best.get('accuracy', 0.0):.4f} < min_smoke_accuracy={args.min_smoke_accuracy:.4f}. "
+            "Inspect the printed Android ONNX Variant Results to locate whether FP32, INT8, or both are failing. "
+            "If only INT8 fails, keep FP32/FP16 Android export for accuracy and report INT8 as rejected."
+        )
+
+    selected_variant = passing_variants[0]
+    write_android_manifest(Path(args.output_dir), selected_variant, variant_results)
+    metrics.update({
+        "selected_variant": selected_variant["variant"],
+        "selected_accuracy": selected_variant["accuracy"],
+        "selected_f1": selected_variant["f1"],
+        "selected_latency_ms_mean": selected_variant["latency_ms_mean"],
+        "selected_size_mb": selected_variant["size_mb"],
+        "selected_quantized": selected_variant["quantized"],
+    })
+    print(
+        "\nSelected Android asset: "
+        f"{selected_variant['variant']} | acc={selected_variant['accuracy']:.4f} | "
+        f"f1={selected_variant['f1']:.4f} | size={selected_variant['size_mb']:.1f} MB"
+    )
 
     if tracking_enabled:
         with mlflow.start_run(run_name="android_qat_int8_export"):
@@ -870,6 +974,8 @@ def main():
                 "onnx_opset": 17,
                 "onnxruntime_provider_target": "NNAPI with CPU fallback",
                 "allow_public_base_fallback": args.allow_public_base_fallback,
+                "skip_qat_training": args.skip_qat_training,
+                "require_quantized": args.require_quantized,
             })
             for key, value in metrics.items():
                 if isinstance(value, bool):
