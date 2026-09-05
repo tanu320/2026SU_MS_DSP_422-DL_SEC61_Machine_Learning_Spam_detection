@@ -150,7 +150,8 @@ def resolve_model_dir(
             return nested_models[0]
 
     search_caches = list(dict.fromkeys([Path(download_dir), Path("downloads")]))
-    if use_download_cache:
+    prefer_remote_run = model_run_id is not None
+    if use_download_cache and not prefer_remote_run:
         existing_downloads = []
         for cache_root in search_caches:
             existing_downloads.extend(discover_model_dirs(cache_root))
@@ -224,7 +225,7 @@ def resolve_model_dir(
             last_error = exc
             print(f"[WARN] Could not download artifact root {artifact_root}: {exc}")
 
-    if use_download_cache:
+    if use_download_cache and not prefer_remote_run:
         discovered = []
         for cache_root in search_caches + [download_root]:
             discovered.extend(discover_model_dirs(cache_root))
