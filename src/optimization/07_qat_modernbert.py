@@ -192,6 +192,19 @@ def load_calibration_frame(path: str, rows: int) -> pd.DataFrame:
 
 
 def prepare_qat_model(model_dir: str):
+    model = load_clean_model(model_dir)
+    model.train()
+
+    model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
+    for module in model.modules():
+        if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
+            module.qconfig = None
+
+    torch.quantization.prepare_qat(model, inplace=True)
+    return model
+
+
+def load_clean_model(model_dir: str):
     model_path = Path(model_dir)
     if (model_path / "adapter_config.json").exists():
         try:
@@ -217,16 +230,31 @@ def prepare_qat_model(model_dir: str):
             torch_dtype=torch.float32,
         )
 
-    model = model.float()
-    model.train()
+    return model.float()
 
-    model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
-    for module in model.modules():
-        if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
-            module.qconfig = None
 
-    torch.quantization.prepare_qat(model, inplace=True)
-    return model
+def copy_qat_weights_to_clean_model(qat_model, model_dir: Path):
+    clean_model = load_clean_model(str(model_dir))
+    clean_state = clean_model.state_dict()
+    qat_state = qat_model.cpu().state_dict()
+
+    copied = 0
+    compatible_state = {}
+    for name, value in qat_state.items():
+        if name not in clean_state:
+            continue
+        if clean_state[name].shape != value.shape:
+            continue
+        compatible_state[name] = value.detach().cpu()
+        copied += 1
+
+    missing, unexpected = clean_model.load_state_dict(compatible_state, strict=False)
+    print(
+        "Copied QAT-trained tensors into clean export model: "
+        f"{copied} tensors | missing={len(missing)} | unexpected={len(unexpected)}"
+    )
+    clean_model.eval()
+    return clean_model
 
 
 def load_tokenizer(model_dir: Path):
@@ -297,14 +325,13 @@ class LogitsWrapper(torch.nn.Module):
         return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
 
 
-def export_int8_onnx(model, tokenizer, output_dir: Path, max_length: int) -> dict:
+def export_int8_onnx(qat_model, model_dir: Path, tokenizer, output_dir: Path, max_length: int) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     fp32_path = output_dir / "modernbert_qat_fp32.onnx"
     int8_path = output_dir / "modernbert_qat_int8.onnx"
 
-    model.eval()
-    model.apply(torch.ao.quantization.disable_fake_quant)
-    wrapped = LogitsWrapper(model).cpu().eval()
+    clean_model = copy_qat_weights_to_clean_model(qat_model, model_dir)
+    wrapped = LogitsWrapper(clean_model).cpu().eval()
 
     dummy = tokenizer(
         "This is a calibration trace for Android export.",
@@ -451,7 +478,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
     )
-    export_metrics = export_int8_onnx(model, tokenizer, Path(args.output_dir), args.max_length)
+    export_metrics = export_int8_onnx(model, model_dir, tokenizer, Path(args.output_dir), args.max_length)
     smoke_metrics = evaluate_onnx_smoke(
         export_metrics["int8_onnx_path"],
         tokenizer,
