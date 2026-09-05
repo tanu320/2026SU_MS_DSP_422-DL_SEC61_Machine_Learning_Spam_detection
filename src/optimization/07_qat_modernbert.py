@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+import copy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -516,6 +517,40 @@ def run_qat_loop(model, dataset: Dataset, tokenizer, device: torch.device, batch
     }
 
 
+def build_eval_sample(df: pd.DataFrame, rows: int) -> pd.DataFrame:
+    return df.sample(n=min(rows, len(df)), random_state=123).reset_index(drop=True)
+
+
+def evaluate_torch_model(model, tokenizer, sample: pd.DataFrame, max_length: int, prefix: str) -> dict:
+    device = next(model.parameters()).device
+    model.eval()
+    preds = []
+    latencies = []
+
+    with torch.no_grad():
+        for _, row in sample.iterrows():
+            inputs = tokenizer(
+                str(row["text"]),
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+            )
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            start = time.time()
+            logits = model(**inputs).logits
+            latencies.append(time.time() - start)
+            preds.append(int(logits.detach().cpu()[0].argmax()))
+
+    y_true = sample["label"].astype(int).tolist()
+    return {
+        f"{prefix}_rows": len(sample),
+        f"{prefix}_accuracy": accuracy_score(y_true, preds),
+        f"{prefix}_f1": f1_score(y_true, preds, zero_division=0),
+        f"{prefix}_latency_ms_mean": 1000 * sum(latencies) / len(latencies) if latencies else 0.0,
+    }
+
+
 class LogitsWrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -607,11 +642,10 @@ def export_int8_onnx(
     }
 
 
-def evaluate_onnx_smoke(onnx_path: str, tokenizer, df: pd.DataFrame, max_length: int, rows: int) -> dict:
+def evaluate_onnx_model(onnx_path: str, tokenizer, sample: pd.DataFrame, max_length: int, prefix: str) -> dict:
     import numpy as np
     import onnxruntime as ort
 
-    sample = df.sample(n=min(rows, len(df)), random_state=123).reset_index(drop=True)
     session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     preds = []
     latencies = []
@@ -634,10 +668,10 @@ def evaluate_onnx_smoke(onnx_path: str, tokenizer, df: pd.DataFrame, max_length:
 
     y_true = sample["label"].astype(int).tolist()
     return {
-        "smoke_rows": len(sample),
-        "smoke_accuracy": accuracy_score(y_true, preds),
-        "smoke_f1": f1_score(y_true, preds, zero_division=0),
-        "smoke_latency_ms_mean": 1000 * sum(latencies) / len(latencies) if latencies else 0.0,
+        f"{prefix}_rows": len(sample),
+        f"{prefix}_accuracy": accuracy_score(y_true, preds),
+        f"{prefix}_f1": f1_score(y_true, preds, zero_division=0),
+        f"{prefix}_latency_ms_mean": 1000 * sum(latencies) / len(latencies) if latencies else 0.0,
     }
 
 
@@ -684,6 +718,17 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--skip_qat_training",
+        action="store_true",
+        help="Export dynamic INT8 ONNX directly from the loaded model. Useful when QAT hurts held-out accuracy.",
+    )
+    parser.add_argument(
+        "--min_smoke_accuracy",
+        type=float,
+        default=0.90,
+        help="Fail the export if INT8 ONNX accuracy on the held-out smoke sample is below this value.",
+    )
     parser.add_argument("--skip_mlflow", action="store_true")
     parser.add_argument(
         "--allow_public_base_fallback",
@@ -706,6 +751,7 @@ def main():
     calibration_df = load_calibration_frame(args.calibration_data, args.calibration_rows)
     ensure_processed_data([args.eval_data], allow_rebuild=True)
     eval_df = pd.read_csv(args.eval_data)
+    eval_sample = build_eval_sample(eval_df, args.eval_rows)
 
     tokenizer = load_tokenizer(
         model_dir,
@@ -723,25 +769,41 @@ def main():
         base_model_experiment=args.base_model_experiment,
         base_download_dir=args.base_download_dir,
     )
-    model.train()
+    model.to(torch.device(args.device))
+    pre_qat_metrics = evaluate_torch_model(model, tokenizer, eval_sample, args.max_length, "torch_pre_qat")
 
-    model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
-    for module in model.modules():
-        if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
-            module.qconfig = None
-    torch.quantization.prepare_qat(model, inplace=True)
+    if args.skip_qat_training:
+        qat_model = copy.deepcopy(model).cpu()
+        qat_metrics = {
+            "qat_steps": 0,
+            "qat_train_seconds": 0.0,
+            "qat_loss_last": 0.0,
+            "qat_loss_mean": 0.0,
+            "qat_training_skipped": True,
+        }
+        post_qat_metrics = evaluate_torch_model(model, tokenizer, eval_sample, args.max_length, "torch_export_source")
+    else:
+        qat_model = model
+        qat_model.train()
+        qat_model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
+        for module in qat_model.modules():
+            if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
+                module.qconfig = None
+        torch.quantization.prepare_qat(qat_model, inplace=True)
 
-    dataset = tokenize_frame(calibration_df, tokenizer, args.max_length)
-    qat_metrics = run_qat_loop(
-        model=model,
-        dataset=dataset,
-        tokenizer=tokenizer,
-        device=torch.device(args.device),
-        batch_size=args.batch_size,
-        lr=args.lr,
-    )
+        dataset = tokenize_frame(calibration_df, tokenizer, args.max_length)
+        qat_metrics = run_qat_loop(
+            model=qat_model,
+            dataset=dataset,
+            tokenizer=tokenizer,
+            device=torch.device(args.device),
+            batch_size=args.batch_size,
+            lr=args.lr,
+        )
+        post_qat_metrics = evaluate_torch_model(qat_model, tokenizer, eval_sample, args.max_length, "torch_post_qat")
+
     export_metrics = export_int8_onnx(
-        model,
+        qat_model,
         model_dir,
         tokenizer,
         Path(args.output_dir),
@@ -752,16 +814,40 @@ def main():
         base_model_experiment=args.base_model_experiment,
         base_download_dir=args.base_download_dir,
     )
-    smoke_metrics = evaluate_onnx_smoke(
+    fp32_onnx_metrics = evaluate_onnx_model(
+        export_metrics["fp32_onnx_path"],
+        tokenizer,
+        eval_sample,
+        args.max_length,
+        "onnx_fp32",
+    )
+    int8_onnx_metrics = evaluate_onnx_model(
         export_metrics["int8_onnx_path"],
         tokenizer,
-        eval_df,
+        eval_sample,
         args.max_length,
-        args.eval_rows,
+        "onnx_int8",
     )
 
-    metrics = {**qat_metrics, **export_metrics, **smoke_metrics}
+    metrics = {
+        **pre_qat_metrics,
+        **qat_metrics,
+        **post_qat_metrics,
+        **export_metrics,
+        **fp32_onnx_metrics,
+        **int8_onnx_metrics,
+    }
     print(json.dumps(metrics, indent=2))
+
+    int8_accuracy = float(int8_onnx_metrics["onnx_int8_accuracy"])
+    if int8_accuracy < args.min_smoke_accuracy:
+        raise RuntimeError(
+            "Android INT8 export failed quality gate: "
+            f"onnx_int8_accuracy={int8_accuracy:.4f} < min_smoke_accuracy={args.min_smoke_accuracy:.4f}. "
+            "Inspect torch_pre_qat_accuracy, torch_post_qat_accuracy, onnx_fp32_accuracy, and "
+            "onnx_int8_accuracy above to locate the degradation point. Try --skip_qat_training "
+            "to test plain dynamic INT8 export before accepting Android assets."
+        )
 
     if tracking_enabled:
         with mlflow.start_run(run_name="android_qat_int8_export"):
@@ -780,13 +866,15 @@ def main():
                 "max_length": args.max_length,
                 "calibration_rows": len(calibration_df),
                 "eval_rows": min(args.eval_rows, len(eval_df)),
-                "quantization": "QAT-assisted dynamic INT8 ONNX",
+                "quantization": "dynamic INT8 ONNX" if args.skip_qat_training else "QAT-assisted dynamic INT8 ONNX",
                 "onnx_opset": 17,
                 "onnxruntime_provider_target": "NNAPI with CPU fallback",
                 "allow_public_base_fallback": args.allow_public_base_fallback,
             })
             for key, value in metrics.items():
-                if isinstance(value, (int, float)):
+                if isinstance(value, bool):
+                    mlflow.log_param(key, str(value))
+                elif isinstance(value, (int, float)):
                     mlflow.log_metric(key, float(value))
                 else:
                     mlflow.log_param(key, value)
