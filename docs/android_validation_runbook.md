@@ -43,6 +43,22 @@ The Android classifier contract is:
 input_ids + attention_mask -> logits[legitimate, scam]
 ```
 
+If `./scam-classifier-model-transcript-lora` is missing after a Kaggle reset, the script
+automatically fetches the latest finished model artifact from:
+
+```text
+scam-detection/refactored_pipeline/05_transcript_modernbert
+```
+
+You can pin a specific run instead:
+
+```bash
+python src/optimization/07_qat_modernbert.py \
+  --model_dir ./scam-classifier-model-transcript-lora \
+  --model_run_id <mlflow_run_id> \
+  --output_dir /path/to/scam-detection-android/app/src/main/assets/models
+```
+
 ## 3. Run Server Baseline On Same Manifest
 
 ```bash

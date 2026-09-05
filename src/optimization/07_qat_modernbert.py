@@ -39,12 +39,10 @@ from src.utils.mlflow_reporting import log_dataframe_artifact, log_json_artifact
 
 
 EXPERIMENT_NAME = "scam-detection/refactored_pipeline/07_android_qat_export"
+DEFAULT_MODEL_EXPERIMENT = "scam-detection/refactored_pipeline/05_transcript_modernbert"
 
 
-def configure_tracking(skip_mlflow: bool) -> bool:
-    if skip_mlflow:
-        return False
-
+def configure_dagshub_mlflow(experiment_name: str | None = None) -> bool:
     load_dotenv()
     repo_owner = os.getenv("DAGSHUB_REPO_OWNER")
     repo_name = os.getenv("DAGSHUB_REPO_NAME")
@@ -61,8 +59,119 @@ def configure_tracking(skip_mlflow: bool) -> bool:
         return False
 
     dagshub.init(repo_name=repo_name, repo_owner=repo_owner, mlflow=True)
-    mlflow.set_experiment(EXPERIMENT_NAME)
+    if experiment_name:
+        mlflow.set_experiment(experiment_name)
     return True
+
+
+def configure_tracking(skip_mlflow: bool) -> bool:
+    if skip_mlflow:
+        return False
+    return configure_dagshub_mlflow(EXPERIMENT_NAME)
+
+
+def find_artifact_path(client, run_id: str, target_name: str, base_path: str = "") -> str | None:
+    for artifact in client.list_artifacts(run_id, path=base_path):
+        if artifact.path.endswith(target_name):
+            return artifact.path
+        if artifact.is_dir:
+            found = find_artifact_path(client, run_id, target_name, artifact.path)
+            if found:
+                return found
+    return None
+
+
+def latest_finished_run_id(experiment_name: str) -> str:
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise RuntimeError(f"MLflow experiment not found: {experiment_name}")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string="attributes.status = 'FINISHED'",
+        order_by=["attributes.start_time DESC"],
+        max_results=20,
+    )
+    if runs.empty:
+        raise RuntimeError(f"No finished runs found in MLflow experiment: {experiment_name}")
+
+    if "metrics.eval_f1" in runs.columns:
+        scored = runs[runs["metrics.eval_f1"].notna()]
+        if not scored.empty:
+            return str(scored.sort_values("start_time", ascending=False).iloc[0].run_id)
+    return str(runs.iloc[0].run_id)
+
+
+def resolve_model_dir(
+    preferred_model_dir: str,
+    model_run_id: str | None,
+    model_experiment: str,
+    download_dir: str,
+) -> Path:
+    model_dir = Path(preferred_model_dir)
+    if (model_dir / "config.json").exists():
+        print(f"Using local model directory: {model_dir}")
+        return model_dir
+
+    print(f"Local model directory not found: {model_dir}")
+    print("Attempting to fetch transcript-trained model from DagsHub MLflow artifacts...")
+    if not configure_dagshub_mlflow(None):
+        raise RuntimeError(
+            "DagsHub/MLflow credentials are required to fetch a missing model. "
+            "Set DAGSHUB_REPO_OWNER, DAGSHUB_REPO_NAME, MLFLOW_TRACKING_USERNAME, "
+            "and MLFLOW_TRACKING_PASSWORD."
+        )
+
+    run_id = model_run_id or latest_finished_run_id(model_experiment)
+    client = mlflow.tracking.MlflowClient()
+    model_artifacts = [
+        find_artifact_path(client, run_id, "model.safetensors"),
+        find_artifact_path(client, run_id, "adapter_model.safetensors"),
+        find_artifact_path(client, run_id, "config.json"),
+        find_artifact_path(client, run_id, "adapter_config.json"),
+    ]
+    model_artifacts = [path for path in model_artifacts if path]
+    if not model_artifacts:
+        raise RuntimeError(
+            f"No Hugging Face model or LoRA adapter artifacts found in run {run_id}. "
+            "Pass --model_run_id explicitly if the latest transcript run is not the model run."
+        )
+
+    candidate_roots = []
+    for artifact_path in model_artifacts:
+        candidate_roots.append(str(Path(artifact_path).parent))
+    # Preserve order while removing duplicates.
+    candidate_roots = list(dict.fromkeys(candidate_roots))
+
+    download_root = Path(download_dir)
+    download_root.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for artifact_root in candidate_roots:
+        try:
+            print(f"Downloading model artifact root: runs:/{run_id}/{artifact_root}")
+            local_root = Path(
+                mlflow.artifacts.download_artifacts(
+                    artifact_uri=f"runs:/{run_id}/{artifact_root}",
+                    dst_path=str(download_root),
+                )
+            )
+            for root, _, files in os.walk(local_root):
+                file_set = set(files)
+                if "config.json" in file_set and "model.safetensors" in file_set:
+                    resolved = Path(root)
+                    print(f"Resolved merged Hugging Face model directory: {resolved}")
+                    return resolved
+                if "adapter_config.json" in file_set and "adapter_model.safetensors" in file_set:
+                    resolved = Path(root)
+                    print(f"Resolved LoRA adapter directory: {resolved}")
+                    return resolved
+        except Exception as exc:
+            last_error = exc
+            print(f"[WARN] Could not download artifact root {artifact_root}: {exc}")
+
+    raise RuntimeError(
+        f"Failed to resolve a usable model directory from run {run_id}. Last error: {last_error}"
+    )
 
 
 def load_calibration_frame(path: str, rows: int) -> pd.DataFrame:
@@ -83,12 +192,32 @@ def load_calibration_frame(path: str, rows: int) -> pd.DataFrame:
 
 
 def prepare_qat_model(model_dir: str):
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_dir,
-        num_labels=2,
-        attn_implementation="eager",
-        torch_dtype=torch.float32,
-    ).float()
+    model_path = Path(model_dir)
+    if (model_path / "adapter_config.json").exists():
+        try:
+            from peft import PeftConfig, PeftModel
+        except ImportError as exc:
+            raise ImportError("Downloaded model is a LoRA adapter; install peft to merge it.") from exc
+
+        peft_config = PeftConfig.from_pretrained(str(model_path))
+        base_model_name = peft_config.base_model_name_or_path
+        print(f"Loading base model for LoRA merge: {base_model_name}")
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            base_model_name,
+            num_labels=2,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
+        model = PeftModel.from_pretrained(base_model, str(model_path)).merge_and_unload()
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            str(model_path),
+            num_labels=2,
+            attn_implementation="eager",
+            torch_dtype=torch.float32,
+        )
+
+    model = model.float()
     model.train()
 
     model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
@@ -98,6 +227,22 @@ def prepare_qat_model(model_dir: str):
 
     torch.quantization.prepare_qat(model, inplace=True)
     return model
+
+
+def load_tokenizer(model_dir: Path):
+    if (model_dir / "tokenizer.json").exists() or (model_dir / "tokenizer_config.json").exists():
+        return AutoTokenizer.from_pretrained(model_dir)
+
+    if (model_dir / "adapter_config.json").exists():
+        try:
+            from peft import PeftConfig
+        except ImportError as exc:
+            raise ImportError("Downloaded model is a LoRA adapter; install peft to resolve tokenizer.") from exc
+
+        peft_config = PeftConfig.from_pretrained(str(model_dir))
+        return AutoTokenizer.from_pretrained(peft_config.base_model_name_or_path)
+
+    return AutoTokenizer.from_pretrained(model_dir)
 
 
 def tokenize_frame(df: pd.DataFrame, tokenizer, max_length: int) -> Dataset:
@@ -252,7 +397,22 @@ def evaluate_onnx_smoke(onnx_path: str, tokenizer, df: pd.DataFrame, max_length:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", default="scam-classifier-model-transcript-lora")
+    parser.add_argument(
+        "--model_dir",
+        default="scam-classifier-model-transcript-lora",
+        help="Preferred local Hugging Face model directory. If missing, fetch from DagsHub MLflow.",
+    )
+    parser.add_argument(
+        "--model_run_id",
+        default=None,
+        help="Optional MLflow run ID containing the transcript-trained model artifacts.",
+    )
+    parser.add_argument(
+        "--model_experiment",
+        default=DEFAULT_MODEL_EXPERIMENT,
+        help="MLflow experiment to search when --model_dir is missing and --model_run_id is omitted.",
+    )
+    parser.add_argument("--download_dir", default="downloads/android_qat_model")
     parser.add_argument("--calibration_data", default="data/processed/ptq_calibration.csv")
     parser.add_argument("--eval_data", default="data/processed/global_test.csv")
     parser.add_argument("--output_dir", default="models/android")
@@ -268,19 +428,19 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model_dir = Path(args.model_dir)
-    if not (model_dir / "config.json").exists():
-        raise FileNotFoundError(
-            f"Expected a local Hugging Face model directory at {model_dir}. "
-            "Fetch the transcript-trained model from DagsHub first or pass --model_dir."
-        )
+    model_dir = resolve_model_dir(
+        preferred_model_dir=args.model_dir,
+        model_run_id=args.model_run_id,
+        model_experiment=args.model_experiment,
+        download_dir=args.download_dir,
+    )
 
     tracking_enabled = configure_tracking(args.skip_mlflow)
     calibration_df = load_calibration_frame(args.calibration_data, args.calibration_rows)
     ensure_processed_data([args.eval_data], allow_rebuild=True)
     eval_df = pd.read_csv(args.eval_data)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer = load_tokenizer(model_dir)
     model = prepare_qat_model(str(model_dir))
     dataset = tokenize_frame(calibration_df, tokenizer, args.max_length)
     qat_metrics = run_qat_loop(
@@ -309,6 +469,9 @@ def main():
             mlflow.set_tag("android_model_contract", "input_ids_attention_mask_to_logits")
             mlflow.log_params({
                 "model_dir": str(model_dir),
+                "requested_model_dir": args.model_dir,
+                "model_run_id": args.model_run_id or "",
+                "model_experiment": args.model_experiment,
                 "calibration_data": args.calibration_data,
                 "eval_data": args.eval_data,
                 "max_length": args.max_length,
