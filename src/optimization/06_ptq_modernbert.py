@@ -1,6 +1,6 @@
 """
-Exports the ASR (Whisper) and Classifier models to GGUF/GGML format 
-for ultra-efficient edge and mobile NPU execution via llama.cpp/whisper.cpp.
+Exports the ASR (Whisper) and Classifier models to GGUF/GGML format
+for efficient Hugging Face Spaces/local CPU execution via llama.cpp/whisper.cpp.
 Quantizes them to the CPU-serving essentials: F16 baseline, Q8_0, and Q4_K_M/Q4_K.
 
 Also provides an optional calibrated ONNX Runtime static INT8 PTQ path for

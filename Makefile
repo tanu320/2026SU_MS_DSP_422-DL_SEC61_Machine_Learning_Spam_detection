@@ -6,14 +6,15 @@ MAX_LENGTH ?= 2048
 MODERNBERT_OUTPUT_DIR ?= ./scam-classifier-model-universal-lora
 TRANSCRIPT_OUTPUT_DIR ?= ./scam-classifier-model-transcript-lora
 MODERNBERT_MODEL_NAME ?= answerdotai/ModernBERT-base
+TEACHER_RUN_ID ?=
+TEACHER_RUN_ARG = $(if $(TEACHER_RUN_ID),--teacher_run_id $(TEACHER_RUN_ID),)
 
 .PHONY: \
 	download-data download-data-no-mlflow \
 	build-data build-data-no-mlflow \
 	validate-data data data-no-mlflow \
 	train-distilbert train-modernbert train-modernbert-lora train-modernbert-full \
-	train-transcript train-transcript-lora quantize evaluate all \
-	android-eval-manifest android-server-baseline android-compare android-qat-export
+	train-transcript train-transcript-lora quantize evaluate distill-mobile-student all
 
 download-data:
 	$(PYTHON) src/data/00_download_raw_data.py
@@ -71,19 +72,12 @@ evaluate: quantize
 	$(PYTHON) src/evaluation/08_combo_benchmark.py
 	$(PYTHON) src/evaluation/09_best_pipeline_selection.py
 
-android-eval-manifest:
-	$(PYTHON) src/evaluation/10_prepare_android_eval_manifest.py
-
-android-server-baseline:
-	$(PYTHON) src/evaluation/11_benchmark_server_baseline.py
-
-android-compare:
-	$(PYTHON) src/evaluation/12_compare_android_server_results.py
-
-android-qat-export:
-	$(PYTHON) src/optimization/07_qat_modernbert.py \
-		--model_dir $(TRANSCRIPT_OUTPUT_DIR) \
-		--output_dir models/android
+distill-mobile-student:
+	$(PYTHON) src/models/07_distill_mobile_student.py \
+		--teacher_model_dir $(TRANSCRIPT_OUTPUT_DIR) \
+		$(TEACHER_RUN_ARG) \
+		--student_model_name minilm \
+		--output_dir ./scam-classifier-model-mobile-student
 
 all:
 	bash run_pipeline.sh

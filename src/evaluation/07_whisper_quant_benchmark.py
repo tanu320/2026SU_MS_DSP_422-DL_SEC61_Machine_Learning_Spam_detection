@@ -105,7 +105,7 @@ def evaluate_whisper():
         
     df = pd.read_csv(manifest_path)
     
-    # CPU-serving essentials: FP16 baseline, Q8 quality candidate, Q5 small/mobile candidate.
+    # CPU-serving essentials: FP16 baseline, Q8 quality candidate, and smaller Q5 candidate.
     variants = ["F16", "Q8_0", "Q5_1"]
     
     load_dotenv()

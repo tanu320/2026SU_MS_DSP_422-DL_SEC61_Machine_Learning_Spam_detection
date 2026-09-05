@@ -59,7 +59,7 @@ def evaluate_combinations():
     }
 
     # Keep the CPU deployment matrix intentionally small:
-    # baseline, likely production candidate, ASR-small candidate, smallest/mobile candidate.
+    # baseline, likely production candidate, ASR-small candidate, and smallest CPU candidate.
     combinations = [
         ("fp16", "fp16"),
         ("gguf_q8", "q8_0"),
