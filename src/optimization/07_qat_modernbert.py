@@ -40,6 +40,7 @@ from src.utils.mlflow_reporting import log_dataframe_artifact, log_json_artifact
 
 EXPERIMENT_NAME = "scam-detection/refactored_pipeline/07_android_qat_export"
 DEFAULT_MODEL_EXPERIMENT = "scam-detection/refactored_pipeline/05_transcript_modernbert"
+DEFAULT_BASE_MODEL_EXPERIMENT = "scam-detection/refactored_pipeline/04_universal_modernbert"
 
 
 def configure_dagshub_mlflow(experiment_name: str | None = None) -> bool:
@@ -70,15 +71,14 @@ def configure_tracking(skip_mlflow: bool) -> bool:
     return configure_dagshub_mlflow(EXPERIMENT_NAME)
 
 
-def find_artifact_path(client, run_id: str, target_name: str, base_path: str = "") -> str | None:
+def find_artifact_paths(client, run_id: str, target_names: set[str], base_path: str = "") -> list[str]:
+    matches = []
     for artifact in client.list_artifacts(run_id, path=base_path):
-        if artifact.path.endswith(target_name):
-            return artifact.path
         if artifact.is_dir:
-            found = find_artifact_path(client, run_id, target_name, artifact.path)
-            if found:
-                return found
-    return None
+            matches.extend(find_artifact_paths(client, run_id, target_names, artifact.path))
+        elif Path(artifact.path).name in target_names:
+            matches.append(artifact.path)
+    return matches
 
 
 def latest_finished_run_id(experiment_name: str) -> str:
@@ -102,16 +102,62 @@ def latest_finished_run_id(experiment_name: str) -> str:
     return str(runs.iloc[0].run_id)
 
 
+def score_model_dir(path: Path) -> int:
+    files = {child.name for child in path.iterdir() if child.is_file()}
+    score = 0
+    if "config.json" in files and "model.safetensors" in files:
+        score += 100
+    if path.name == "hf_model_artifacts":
+        score += 25
+    if "adapter_config.json" in files and "adapter_model.safetensors" in files:
+        score += 50
+    if "tokenizer.json" in files or "tokenizer_config.json" in files:
+        score += 10
+    if path.name.startswith("checkpoint-"):
+        score -= 20
+    return score
+
+
+def discover_model_dirs(root: Path) -> list[Path]:
+    candidates = []
+    if not root.exists():
+        return candidates
+    for dirpath, _, filenames in os.walk(root):
+        files = set(filenames)
+        if "config.json" in files and "model.safetensors" in files:
+            candidates.append(Path(dirpath))
+        elif "adapter_config.json" in files and "adapter_model.safetensors" in files:
+            candidates.append(Path(dirpath))
+    return sorted(candidates, key=score_model_dir, reverse=True)
+
+
 def resolve_model_dir(
     preferred_model_dir: str,
     model_run_id: str | None,
     model_experiment: str,
     download_dir: str,
+    use_download_cache: bool = True,
 ) -> Path:
     model_dir = Path(preferred_model_dir)
-    if (model_dir / "config.json").exists():
+    if (model_dir / "config.json").exists() or (model_dir / "adapter_config.json").exists():
         print(f"Using local model directory: {model_dir}")
         return model_dir
+
+    if model_dir.exists():
+        nested_models = discover_model_dirs(model_dir)
+        if nested_models:
+            print(f"Using nested model directory under requested path: {nested_models[0]}")
+            return nested_models[0]
+
+    search_caches = list(dict.fromkeys([Path(download_dir), Path("downloads")]))
+    if use_download_cache:
+        existing_downloads = []
+        for cache_root in search_caches:
+            existing_downloads.extend(discover_model_dirs(cache_root))
+        existing_downloads = sorted(list(dict.fromkeys(existing_downloads)), key=score_model_dir, reverse=True)
+        if existing_downloads:
+            print(f"Using model already available in download cache: {existing_downloads[0]}")
+            return existing_downloads[0]
 
     print(f"Local model directory not found: {model_dir}")
     print("Attempting to fetch transcript-trained model from DagsHub MLflow artifacts...")
@@ -124,12 +170,11 @@ def resolve_model_dir(
 
     run_id = model_run_id or latest_finished_run_id(model_experiment)
     client = mlflow.tracking.MlflowClient()
-    model_artifacts = [
-        find_artifact_path(client, run_id, "model.safetensors"),
-        find_artifact_path(client, run_id, "adapter_model.safetensors"),
-        find_artifact_path(client, run_id, "config.json"),
-        find_artifact_path(client, run_id, "adapter_config.json"),
-    ]
+    model_artifacts = find_artifact_paths(
+        client,
+        run_id,
+        {"model.safetensors", "adapter_model.safetensors", "config.json", "adapter_config.json"},
+    )
     model_artifacts = [path for path in model_artifacts if path]
     if not model_artifacts:
         raise RuntimeError(
@@ -143,6 +188,18 @@ def resolve_model_dir(
     # Preserve order while removing duplicates.
     candidate_roots = list(dict.fromkeys(candidate_roots))
 
+    def remote_root_score(path: str) -> int:
+        score = 0
+        if path.endswith("hf_model_artifacts"):
+            score += 30
+        if "/checkpoint-" in path or path.startswith("checkpoint-"):
+            score -= 30
+        if path.endswith("adapter_model.safetensors"):
+            score -= 10
+        return score
+
+    candidate_roots = sorted(candidate_roots, key=remote_root_score, reverse=True)
+
     download_root = Path(download_dir)
     download_root.mkdir(parents=True, exist_ok=True)
     last_error = None
@@ -155,22 +212,115 @@ def resolve_model_dir(
                     dst_path=str(download_root),
                 )
             )
-            for root, _, files in os.walk(local_root):
-                file_set = set(files)
-                if "config.json" in file_set and "model.safetensors" in file_set:
-                    resolved = Path(root)
+            discovered = discover_model_dirs(local_root)
+            if discovered:
+                resolved = discovered[0]
+                if (resolved / "config.json").exists() and (resolved / "model.safetensors").exists():
                     print(f"Resolved merged Hugging Face model directory: {resolved}")
-                    return resolved
-                if "adapter_config.json" in file_set and "adapter_model.safetensors" in file_set:
-                    resolved = Path(root)
+                else:
                     print(f"Resolved LoRA adapter directory: {resolved}")
-                    return resolved
+                return resolved
         except Exception as exc:
             last_error = exc
             print(f"[WARN] Could not download artifact root {artifact_root}: {exc}")
 
+    if use_download_cache:
+        discovered = []
+        for cache_root in search_caches + [download_root]:
+            discovered.extend(discover_model_dirs(cache_root))
+        discovered = sorted(list(dict.fromkeys(discovered)), key=score_model_dir, reverse=True)
+        if discovered:
+            print(f"Resolved model directory from downloaded artifact cache: {discovered[0]}")
+            return discovered[0]
+
     raise RuntimeError(
         f"Failed to resolve a usable model directory from run {run_id}. Last error: {last_error}"
+    )
+
+
+def resolve_relative_base_model(
+    base_model_name: str,
+    adapter_dir: Path,
+    base_model_dir: str | None = None,
+    base_model_run_id: str | None = None,
+    base_model_experiment: str = DEFAULT_BASE_MODEL_EXPERIMENT,
+    download_dir: str = "downloads/android_qat_base_model",
+    allow_public_base_fallback: bool = False,
+) -> str:
+    if not base_model_name.startswith("."):
+        return base_model_name
+
+    if base_model_dir:
+        explicit_base = Path(base_model_dir)
+        if (explicit_base / "config.json").exists() or (explicit_base / "adapter_config.json").exists():
+            print(f"Using explicit LoRA base model directory: {explicit_base}")
+            return str(explicit_base)
+        nested_base = discover_model_dirs(explicit_base)
+        if nested_base:
+            print(f"Using nested explicit LoRA base model directory: {nested_base[0]}")
+            return str(nested_base[0])
+        raise FileNotFoundError(f"--base_model_dir was provided but no model files were found under {explicit_base}")
+
+    direct = (Path.cwd() / base_model_name).resolve()
+    if (direct / "config.json").exists() or (direct / "adapter_config.json").exists():
+        return str(direct)
+    if direct.exists():
+        nested_direct = discover_model_dirs(direct)
+        if nested_direct:
+            print(f"Resolved nested local LoRA base model '{base_model_name}' -> {nested_direct[0]}")
+            return str(nested_direct[0])
+
+    target_name = Path(base_model_name).name
+    search_roots = [
+        adapter_dir.parent,
+        adapter_dir.parents[1] if len(adapter_dir.parents) > 1 else adapter_dir.parent,
+        Path("downloads"),
+        Path("."),
+    ]
+    matches = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for candidate in discover_model_dirs(root):
+            if candidate.name == target_name or target_name in str(candidate):
+                matches.append(candidate)
+
+    if matches:
+        matches = sorted(matches, key=score_model_dir, reverse=True)
+        print(f"Resolved relative LoRA base model '{base_model_name}' -> {matches[0]}")
+        return str(matches[0])
+
+    if base_model_experiment:
+        print(
+            f"Could not resolve local LoRA base '{base_model_name}'. "
+            f"Attempting to fetch it from MLflow experiment: {base_model_experiment}"
+        )
+        try:
+            fetched_base = resolve_model_dir(
+                preferred_model_dir=base_model_name,
+                model_run_id=base_model_run_id,
+                model_experiment=base_model_experiment,
+                download_dir=download_dir,
+                use_download_cache=False,
+            )
+            print(f"Resolved LoRA base model from MLflow: {fetched_base}")
+            return str(fetched_base)
+        except Exception as exc:
+            print(f"[WARN] Could not fetch LoRA base model from MLflow: {exc}")
+
+    if allow_public_base_fallback:
+        fallback = "answerdotai/ModernBERT-base"
+        print(
+            f"[WARN] Could not resolve local LoRA base '{base_model_name}'. "
+            f"Falling back to {fallback} because --allow_public_base_fallback was set."
+        )
+        return fallback
+
+    raise FileNotFoundError(
+        f"LoRA adapter expects local base model '{base_model_name}', but it was not found. "
+        "This usually means the downloaded checkpoint is an adapter-only artifact. "
+        "Pass a merged model directory via --model_dir, provide the universal base model artifacts, "
+        "or rerun with --allow_public_base_fallback only for a non-final smoke test."
     )
 
 
@@ -191,8 +341,11 @@ def load_calibration_frame(path: str, rows: int) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def prepare_qat_model(model_dir: str):
-    model = load_clean_model(model_dir)
+def prepare_qat_model(model_dir: str, allow_public_base_fallback: bool):
+    model = load_clean_model(
+        model_dir,
+        allow_public_base_fallback=allow_public_base_fallback,
+    )
     model.train()
 
     model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
@@ -204,7 +357,14 @@ def prepare_qat_model(model_dir: str):
     return model
 
 
-def load_clean_model(model_dir: str):
+def load_clean_model(
+    model_dir: str,
+    allow_public_base_fallback: bool = False,
+    base_model_dir: str | None = None,
+    base_model_run_id: str | None = None,
+    base_model_experiment: str = DEFAULT_BASE_MODEL_EXPERIMENT,
+    base_download_dir: str = "downloads/android_qat_base_model",
+):
     model_path = Path(model_dir)
     if (model_path / "adapter_config.json").exists():
         try:
@@ -213,7 +373,15 @@ def load_clean_model(model_dir: str):
             raise ImportError("Downloaded model is a LoRA adapter; install peft to merge it.") from exc
 
         peft_config = PeftConfig.from_pretrained(str(model_path))
-        base_model_name = peft_config.base_model_name_or_path
+        base_model_name = resolve_relative_base_model(
+            peft_config.base_model_name_or_path,
+            model_path,
+            base_model_dir=base_model_dir,
+            base_model_run_id=base_model_run_id,
+            base_model_experiment=base_model_experiment,
+            download_dir=base_download_dir,
+            allow_public_base_fallback=allow_public_base_fallback,
+        )
         print(f"Loading base model for LoRA merge: {base_model_name}")
         base_model = AutoModelForSequenceClassification.from_pretrained(
             base_model_name,
@@ -233,8 +401,23 @@ def load_clean_model(model_dir: str):
     return model.float()
 
 
-def copy_qat_weights_to_clean_model(qat_model, model_dir: Path):
-    clean_model = load_clean_model(str(model_dir))
+def copy_qat_weights_to_clean_model(
+    qat_model,
+    model_dir: Path,
+    allow_public_base_fallback: bool,
+    base_model_dir: str | None = None,
+    base_model_run_id: str | None = None,
+    base_model_experiment: str = DEFAULT_BASE_MODEL_EXPERIMENT,
+    base_download_dir: str = "downloads/android_qat_base_model",
+):
+    clean_model = load_clean_model(
+        str(model_dir),
+        allow_public_base_fallback=allow_public_base_fallback,
+        base_model_dir=base_model_dir,
+        base_model_run_id=base_model_run_id,
+        base_model_experiment=base_model_experiment,
+        base_download_dir=base_download_dir,
+    )
     clean_state = clean_model.state_dict()
     qat_state = qat_model.cpu().state_dict()
 
@@ -257,7 +440,14 @@ def copy_qat_weights_to_clean_model(qat_model, model_dir: Path):
     return clean_model
 
 
-def load_tokenizer(model_dir: Path):
+def load_tokenizer(
+    model_dir: Path,
+    allow_public_base_fallback: bool = False,
+    base_model_dir: str | None = None,
+    base_model_run_id: str | None = None,
+    base_model_experiment: str = DEFAULT_BASE_MODEL_EXPERIMENT,
+    base_download_dir: str = "downloads/android_qat_base_model",
+):
     if (model_dir / "tokenizer.json").exists() or (model_dir / "tokenizer_config.json").exists():
         return AutoTokenizer.from_pretrained(model_dir)
 
@@ -268,7 +458,16 @@ def load_tokenizer(model_dir: Path):
             raise ImportError("Downloaded model is a LoRA adapter; install peft to resolve tokenizer.") from exc
 
         peft_config = PeftConfig.from_pretrained(str(model_dir))
-        return AutoTokenizer.from_pretrained(peft_config.base_model_name_or_path)
+        base_model_name = resolve_relative_base_model(
+            peft_config.base_model_name_or_path,
+            model_dir,
+            base_model_dir=base_model_dir,
+            base_model_run_id=base_model_run_id,
+            base_model_experiment=base_model_experiment,
+            download_dir=base_download_dir,
+            allow_public_base_fallback=allow_public_base_fallback,
+        )
+        return AutoTokenizer.from_pretrained(base_model_name)
 
     return AutoTokenizer.from_pretrained(model_dir)
 
@@ -325,12 +524,31 @@ class LogitsWrapper(torch.nn.Module):
         return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
 
 
-def export_int8_onnx(qat_model, model_dir: Path, tokenizer, output_dir: Path, max_length: int) -> dict:
+def export_int8_onnx(
+    qat_model,
+    model_dir: Path,
+    tokenizer,
+    output_dir: Path,
+    max_length: int,
+    allow_public_base_fallback: bool,
+    base_model_dir: str | None = None,
+    base_model_run_id: str | None = None,
+    base_model_experiment: str = DEFAULT_BASE_MODEL_EXPERIMENT,
+    base_download_dir: str = "downloads/android_qat_base_model",
+) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     fp32_path = output_dir / "modernbert_qat_fp32.onnx"
     int8_path = output_dir / "modernbert_qat_int8.onnx"
 
-    clean_model = copy_qat_weights_to_clean_model(qat_model, model_dir)
+    clean_model = copy_qat_weights_to_clean_model(
+        qat_model,
+        model_dir,
+        allow_public_base_fallback,
+        base_model_dir=base_model_dir,
+        base_model_run_id=base_model_run_id,
+        base_model_experiment=base_model_experiment,
+        base_download_dir=base_download_dir,
+    )
     wrapped = LogitsWrapper(clean_model).cpu().eval()
 
     dummy = tokenizer(
@@ -440,6 +658,22 @@ def parse_args():
         help="MLflow experiment to search when --model_dir is missing and --model_run_id is omitted.",
     )
     parser.add_argument("--download_dir", default="downloads/android_qat_model")
+    parser.add_argument(
+        "--base_model_dir",
+        default=None,
+        help="Optional local universal-model directory needed when the transcript artifact is a LoRA adapter.",
+    )
+    parser.add_argument(
+        "--base_model_run_id",
+        default=None,
+        help="Optional MLflow run ID for the universal base model used by the transcript LoRA adapter.",
+    )
+    parser.add_argument(
+        "--base_model_experiment",
+        default=DEFAULT_BASE_MODEL_EXPERIMENT,
+        help="MLflow experiment to search for the missing universal LoRA base model.",
+    )
+    parser.add_argument("--base_download_dir", default="downloads/android_qat_base_model")
     parser.add_argument("--calibration_data", default="data/processed/ptq_calibration.csv")
     parser.add_argument("--eval_data", default="data/processed/global_test.csv")
     parser.add_argument("--output_dir", default="models/android")
@@ -450,6 +684,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--skip_mlflow", action="store_true")
+    parser.add_argument(
+        "--allow_public_base_fallback",
+        action="store_true",
+        help="Allow adapter-only smoke export by merging on answerdotai/ModernBERT-base if the local adapter base is missing. Do not use for final metrics.",
+    )
     return parser.parse_args()
 
 
@@ -467,8 +706,30 @@ def main():
     ensure_processed_data([args.eval_data], allow_rebuild=True)
     eval_df = pd.read_csv(args.eval_data)
 
-    tokenizer = load_tokenizer(model_dir)
-    model = prepare_qat_model(str(model_dir))
+    tokenizer = load_tokenizer(
+        model_dir,
+        allow_public_base_fallback=args.allow_public_base_fallback,
+        base_model_dir=args.base_model_dir,
+        base_model_run_id=args.base_model_run_id,
+        base_model_experiment=args.base_model_experiment,
+        base_download_dir=args.base_download_dir,
+    )
+    model = load_clean_model(
+        str(model_dir),
+        allow_public_base_fallback=args.allow_public_base_fallback,
+        base_model_dir=args.base_model_dir,
+        base_model_run_id=args.base_model_run_id,
+        base_model_experiment=args.base_model_experiment,
+        base_download_dir=args.base_download_dir,
+    )
+    model.train()
+
+    model.qconfig = torch.quantization.get_default_qat_qconfig("qnnpack")
+    for module in model.modules():
+        if isinstance(module, (torch.nn.Embedding, torch.nn.LayerNorm)):
+            module.qconfig = None
+    torch.quantization.prepare_qat(model, inplace=True)
+
     dataset = tokenize_frame(calibration_df, tokenizer, args.max_length)
     qat_metrics = run_qat_loop(
         model=model,
@@ -478,7 +739,18 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
     )
-    export_metrics = export_int8_onnx(model, model_dir, tokenizer, Path(args.output_dir), args.max_length)
+    export_metrics = export_int8_onnx(
+        model,
+        model_dir,
+        tokenizer,
+        Path(args.output_dir),
+        args.max_length,
+        args.allow_public_base_fallback,
+        base_model_dir=args.base_model_dir,
+        base_model_run_id=args.base_model_run_id,
+        base_model_experiment=args.base_model_experiment,
+        base_download_dir=args.base_download_dir,
+    )
     smoke_metrics = evaluate_onnx_smoke(
         export_metrics["int8_onnx_path"],
         tokenizer,
@@ -499,6 +771,9 @@ def main():
                 "requested_model_dir": args.model_dir,
                 "model_run_id": args.model_run_id or "",
                 "model_experiment": args.model_experiment,
+                "base_model_dir": args.base_model_dir or "",
+                "base_model_run_id": args.base_model_run_id or "",
+                "base_model_experiment": args.base_model_experiment,
                 "calibration_data": args.calibration_data,
                 "eval_data": args.eval_data,
                 "max_length": args.max_length,
@@ -507,6 +782,7 @@ def main():
                 "quantization": "QAT-assisted dynamic INT8 ONNX",
                 "onnx_opset": 17,
                 "onnxruntime_provider_target": "NNAPI with CPU fallback",
+                "allow_public_base_fallback": args.allow_public_base_fallback,
             })
             for key, value in metrics.items():
                 if isinstance(value, (int, float)):
