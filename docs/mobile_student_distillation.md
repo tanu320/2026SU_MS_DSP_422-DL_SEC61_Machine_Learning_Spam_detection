@@ -19,6 +19,11 @@ The frozen global test split should remain untouched until final model selection
 
 ## Smoke Test
 
+This validates the plumbing only: DagsHub artifact fetch, teacher-logit generation,
+student training loop, evaluation, and MLflow artifact logging. It is expected to
+score poorly with only five optimization steps and should not create a registry
+model version.
+
 ```bash
 python src/models/07_distill_mobile_student.py \
   --teacher_run_id 62ffeee7d6d446babb855d5c4af082ce \
@@ -40,6 +45,7 @@ python src/models/07_distill_mobile_student.py \
   --max_length 512 \
   --temperature 2.0 \
   --alpha 0.5 \
+  --register_model \
   --output_dir ./scam-classifier-model-mobile-student
 ```
 
@@ -54,6 +60,7 @@ python src/models/07_distill_mobile_student.py \
   --max_length 512 \
   --temperature 2.0 \
   --alpha 0.5 \
+  --register_model \
   --output_dir ./scam-classifier-model-mobilebert-student
 ```
 

@@ -366,6 +366,18 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--run_name", default=None)
+    parser.add_argument(
+        "--register_model",
+        action="store_true",
+        help="Register the student in the MLflow Model Registry. Keep this off for smoke tests.",
+    )
+    parser.add_argument(
+        "--min_f1_for_registry",
+        type=float,
+        default=0.90,
+        help="Minimum eval F1 required before --register_model can register a model version.",
+    )
     parser.add_argument("--skip_mlflow", action="store_true")
     return parser.parse_args()
 
@@ -470,7 +482,12 @@ def main():
     print(f"Student model saved to {args.output_dir}")
 
     if tracking_enabled and is_main_process():
-        with mlflow.start_run(run_name="07-mobile-student-distillation"):
+        run_name = args.run_name or (
+            "07-mobile-student-distillation-smoke"
+            if args.max_steps > 0 or args.max_train_samples or args.max_eval_samples
+            else "07-mobile-student-distillation"
+        )
+        with mlflow.start_run(run_name=run_name):
             mlflow.set_tag("pipeline_stage", PIPELINE_STAGE)
             mlflow.set_tag("model_family", "teacher_student_distillation")
             mlflow.log_params({
@@ -488,6 +505,8 @@ def main():
                 "temperature": args.temperature,
                 "alpha": args.alpha,
                 "distillation_loss": "alpha*CE + (1-alpha)*KL(student||teacher)",
+                "register_model": args.register_model,
+                "min_f1_for_registry": args.min_f1_for_registry,
             })
             for key, value in metrics.items():
                 if isinstance(value, (int, float)):
@@ -495,13 +514,27 @@ def main():
             log_split_profile({"train": train_df, "eval": eval_df})
             log_classification_artifacts(y_true, y_pred, artifact_path="evaluation", prefix="mobile_student")
             log_training_history(trainer.state.log_history, artifact_path="training", prefix="mobile_student")
-            log_transformer_model_with_fallback(
-                components={"model": student_model, "tokenizer": student_tokenizer},
-                output_dir=args.output_dir,
-                artifact_path=PIPELINE_STAGE,
-                registered_model_name="Mobile-Student-Scam-Classifier",
-                task="text-classification",
-            )
+            eval_f1 = float(metrics.get("eval_f1", 0.0))
+            if args.register_model and eval_f1 >= args.min_f1_for_registry:
+                log_transformer_model_with_fallback(
+                    components={"model": student_model, "tokenizer": student_tokenizer},
+                    output_dir=args.output_dir,
+                    artifact_path=PIPELINE_STAGE,
+                    registered_model_name="Mobile-Student-Scam-Classifier",
+                    task="text-classification",
+                )
+            else:
+                mlflow.log_artifacts(args.output_dir, artifact_path=f"{PIPELINE_STAGE}/hf_model_artifacts")
+                mlflow.set_tag("model_logging_mode", "hf_artifacts_only")
+                if args.register_model:
+                    mlflow.set_tag("registry_skipped_reason", f"eval_f1 {eval_f1:.4f} below {args.min_f1_for_registry:.4f}")
+                    print(
+                        "Skipped model registry registration because "
+                        f"eval_f1={eval_f1:.4f} < min_f1_for_registry={args.min_f1_for_registry:.4f}."
+                    )
+                else:
+                    mlflow.set_tag("registry_skipped_reason", "register_model flag not set")
+                    print("Logged student artifacts to MLflow; registry registration was not requested.")
 
 
 if __name__ == "__main__":

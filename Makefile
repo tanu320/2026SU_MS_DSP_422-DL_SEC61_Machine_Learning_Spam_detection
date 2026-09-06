@@ -8,6 +8,8 @@ TRANSCRIPT_OUTPUT_DIR ?= ./scam-classifier-model-transcript-lora
 MODERNBERT_MODEL_NAME ?= answerdotai/ModernBERT-base
 TEACHER_RUN_ID ?=
 TEACHER_RUN_ARG = $(if $(TEACHER_RUN_ID),--teacher_run_id $(TEACHER_RUN_ID),)
+REGISTER_STUDENT ?=
+REGISTER_STUDENT_ARG = $(if $(REGISTER_STUDENT),--register_model,)
 
 .PHONY: \
 	download-data download-data-no-mlflow \
@@ -77,6 +79,7 @@ distill-mobile-student:
 		--teacher_model_dir $(TRANSCRIPT_OUTPUT_DIR) \
 		$(TEACHER_RUN_ARG) \
 		--student_model_name minilm \
+		$(REGISTER_STUDENT_ARG) \
 		--output_dir ./scam-classifier-model-mobile-student
 
 all:
